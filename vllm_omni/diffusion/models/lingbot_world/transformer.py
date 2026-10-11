@@ -320,21 +320,46 @@ class LingBotSelfAttention(nn.Module):
         sink_tokens: int,
         update_cache: bool = True,
     ) -> torch.Tensor:
-        # Project logical [B, S, D] tokens into TP-local
-        # [B, S, num_local_heads, head_dim].
-        qkv, _ = self.qkv(hidden_states)
-        query, key, value = qkv.split((self.tp_inner_dim, self.tp_inner_dim, self.tp_inner_dim), dim=-1)
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
-        query = query.unflatten(2, (self.num_local_heads, self.head_dim))
-        key = key.unflatten(2, (self.num_local_heads, self.head_dim))
-        value = value.unflatten(2, (self.num_local_heads, self.head_dim))
+        query, key, value = self.project_qkv(hidden_states)
         if rotary_emb is not None:
             cos, sin = rotary_emb
             query = self.rotary_embedding(query, cos, sin)
             key = self.rotary_embedding(key, cos, sin)
+        output = self.attend(
+            query,
+            key,
+            value,
+            cache=cache,
+            current_start=current_start,
+            sink_tokens=sink_tokens,
+            update_cache=update_cache,
+        )
+        return self.o(output.flatten(2, 3))
 
+    def project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project logical [B, S, D] tokens into normalized TP-local [B, S, num_local_heads, head_dim] q/k/v."""
+        qkv, _ = self.qkv(hidden_states)
+        query, key, value = qkv.split((self.tp_inner_dim, self.tp_inner_dim, self.tp_inner_dim), dim=-1)
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+        return (
+            query.unflatten(2, (self.num_local_heads, self.head_dim)),
+            key.unflatten(2, (self.num_local_heads, self.head_dim)),
+            value.unflatten(2, (self.num_local_heads, self.head_dim)),
+        )
+
+    def attend(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs,
+        current_start: int,
+        sink_tokens: int,
+        update_cache: bool,
+    ) -> torch.Tensor:
+        """Attend position-encoded TP-local q/k/v over ``cache``; returns TP-local heads before ``o``."""
         if self.ulysses_world_size > 1:
             # One fused sequence->head all-to-all for q/k/v instead of three:
             # (B, S/N, 3, H, D) -> (B, S, 3, H/N, D). Same head-group assignment
@@ -421,7 +446,7 @@ class LingBotSelfAttention(nn.Module):
                 output = self.attn(query, visible_key, visible_value)
         if self.ulysses_world_size > 1:
             output = SeqAllToAll4D.apply(self.ulysses_group, output, 1, 2, False)
-        return self.o(output.flatten(2, 3))
+        return output
 
 
 class LingBotCrossAttention(nn.Module):
